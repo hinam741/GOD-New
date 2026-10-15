@@ -1,0 +1,68 @@
+## Geometry-driven OOD Detectors Are Class-Incremental Learners (CVPR26)
+
+
+
+## Abstract
+Class-Incremental Learning (CIL) seeks to acquire new classes over time without erasing prior knowledge. While recent methods leverage pre-trained models (PTMs) to curb forgetting, they largely optimize the feature extractor and overlook the crucial classification head.
+In this work, we advance a simple view: if each task is equipped with a classifier that has the ability to both recognize in-distribution (IND) classes and reject out-of-distribution (OOD) inputs, CIL arises naturally—inputs are accepted only by heads that deem them in-distribution and rejected otherwise.
+Supported by rigorous theoretical and empirical studies, we find that this ability is characterized by \textbf{Inter-class Separation} and \textbf{Intra-class Compactness}; lacking these, standard linear and cosine-similarity heads remain closed-set and fail to yield a usable OOD signal.
+To address this, we propose \textbf{GOD} (\textbf{G}eometry-driven \textbf{O}OD \textbf{D}etectors), which unifies IND recognition and OOD rejection in a single geometric space by replacing the learnable head with fixed Equiangular Tight Frame (ETF) anchors; an ETF loss enforces inter-class separation, and an ArcFace loss further tightens intra-class compactness. For efficiency, we further introduce a parameter-efficient hybrid architecture and an efficient inference strategy, thus reducing both parameter footprint and inference cost. Extensive experiments on multiple incremental settings and datasets show that GOD achieves state-of-the-art results.
+### Run experiment
+To get started, set up a conda environment and install the requirements listed by our repo.
+
+```bash
+conda env create -f environment.yml
+```
+### Datasets
+We have implemented the pre-processing datasets as follows:
+
+- **CIFAR100**: will be automatically downloaded by the code.
+- **ImageNet-R**: Google Drive: [link](https://drive.google.com/file/d/1SG4TbiL8_DooekztyCVK8mPmfhMo8fkR/view?usp=sharing) or Onedrive: [link](https://entuedu-my.sharepoint.com/:u:/g/personal/n2207876b_e_ntu_edu_sg/EU4jyLL29CtBsZkB6y-JSbgBzWF5YHhBAUz1Qw8qM2954A?e=hlWpNW)
+- **ImageNet-A**: Google Drive: [link](https://drive.google.com/file/d/19l52ua_vvTtttgVRziCZJjal0TPE9f2p/view?usp=sharing) or Onedrive: [link](https://entuedu-my.sharepoint.com/:u:/g/personal/n2207876b_e_ntu_edu_sg/ERYi36eg9b1KkfEplgFTW3gBg1otwWwkQPSml0igWBC46A?e=NiTUkL)
+- **OmniBenchmark**: Google Drive: [link](https://drive.google.com/file/d/1AbCP3zBMtv_TDXJypOCnOgX8hJmvJm3u/view?usp=sharing) or Onedrive: [link](https://entuedu-my.sharepoint.com/:u:/g/personal/n2207876b_e_ntu_edu_sg/EcoUATKl24JFo3jBMnTV2WcBwkuyBH0TmCAy6Lml1gOHJA?e=eCNcoA)
+- **Car196**: [link](https://github.com/jhpohovey/StanfordCars-Dataset)
+- **CUB**: [link](https://www.vision.caltech.edu/datasets/cub_200_2011/)
+
+### Pre-trained weights
+
+- [Sup-21K VIT](https://storage.googleapis.com/vit_models/imagenet21k/ViT-B_16.npz)
+- [iBOT](https://lf3-nlp-opensource.bytetos.com/obj/nlp-opensource/archive/2022/ibot/vitb_16/checkpoint_teacher.pth)
+- [DINO](https://dl.fbaipublicfiles.com/dino/dino_vitbase16_pretrain/dino_vitbase16_pretrain.pth)  
+
+When training , you should specify the folder of your dataset in `utils/data.py`.
+
+```python
+  def download_data(self):
+     assert 0,"You should specify the folder of your dataset"
+     train_dir = '[DATA-PATH]/train/'
+     test_dir = '[DATA-PATH]/val/'
+```
+
+When using the pre-trained weights of iBOT and DINO, you should download the corresponding pre-trained weights to the **Moal/checkpoints/** folder.
+
+```python
+  def vit_base_patch16_224_adapter_dino(pretrained=False, **kwargs):
+      model = VisionTransformer(patch_size=16, embed_dim=768, depth=12, num_heads=12, mlp_ratio=4, qkv_bias=True,
+          norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
+      ckpt = torch.load('Your_path', map_location='cpu')
+
+```
+### To Train
+
+```bash
+python main.py --config=exps\[dataset_name].json
+```
+
+
+
+## **Acknowledgments**
+
+
+We thank the following repos providing helpful components/functions in our work.
+
+- [PyCIL](https://github.com/G-U-N/PyCIL)
+- [RevisitingCIL](https://github.com/zhoudw-zdw/RevisitingCIL)
+- [l2p-pytorch](https://github.com/JH-LEE-KR/l2p-pytorch)
+- [CODA-Prompt](https://github.com/GT-RIPL/CODA-Prompt)
+- [LAMDA-PILOT](https://github.com/sun-hailong/LAMDA-PILOT)
+
