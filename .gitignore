@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.DS_Store
+.idea/
+.vscode/
+implementation_plan.md
+data/
+new_datasets.txt
+*ipynb/
+*.ipynb
+*Paper/
+*.md/
