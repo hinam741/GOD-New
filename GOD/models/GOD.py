@@ -20,6 +20,8 @@ class Learner(BaseLearner):
         super().__init__(args)
         self.args = args
         self._network = IncrementalNet_ETF_mutli_lora(args, True)
+        self.k_strategy = args.get("k_strategy", "fixed")
+        self.split_strategy = args.get("split_strategy", "fixed")
         self.lora_ids = []
         self._means = None
         self._old_network =None
@@ -85,14 +87,51 @@ class Learner(BaseLearner):
         else:
             self._network.backbone.add_task()
             self.lora_ids.append(self._cur_task)
-            for param in self._network.parameters():
-                param.requires_grad = False
-            self._network.backbone.unfreeze_lora([self._cur_task],self.args["free"])
+            # Build the new task head first so the warm-up profiler can run a
+            # real forward/backward through the current task.
             self._network.update_simplefc(self._total_classes)
-            for param in self._network.simple_fc.parameters():
-                param.requires_grad = True
             self._network.to(self._device)
             self._network.fc.add_task_layer()
+            self._network.to(self._device)
+
+            # --- Level-1 Macro: decide the per-task split point k_t ---
+            if self.split_strategy == "dynamic":
+                from utils.dynamic_split import profile_layer_shift, decide_split_k
+                fisher = profile_layer_shift(
+                    self._network, self.train_loader_warm, self._device,
+                    self._cur_task, self._known_classes,
+                    warmup_batches=self.args.get("warmup_batches", 10),
+                )
+                k_t, kinfo = decide_split_k(
+                    fisher,
+                    K_coarse=self.args.get("K_coarse", self.args.get("free", 9)),
+                    K_floor=self.args.get("K_floor", 6),
+                    k_min=self.args.get("split_k_min", self.args.get("K_floor", 6)),
+                    tau=self.args.get("shift_tau", 1.15),
+                    gamma=self.args.get("shift_gamma", 6.0),
+                    efficiency_lambda=self.args.get("efficiency_lambda", 0.0),
+                )
+                logging.info(
+                    "[DynamicSplit] task {}: k_t={} info={} fisher={}".format(
+                        self._cur_task, k_t, kinfo,
+                        ["{:.2e}".format(v) for v in fisher])
+                )
+            else:
+                k_t = self.args["free"]
+
+            for param in self._network.parameters():
+                param.requires_grad = False
+            self._network.backbone.unfreeze_lora([self._cur_task], k_t)
+            for param in self._network.simple_fc.parameters():
+                param.requires_grad = True
+            # Task-specific projection TP_t (newest mapping layer) must stay
+            # trainable; it was created before the freeze-all above.
+            for param in self._network.fc.mapping_layer[-1].parameters():
+                param.requires_grad = True
+            # Per-task gates for this task are trainable when micro-gating is on.
+            if self.args.get("use_gating", False) and len(self._network.backbone.per_task_gates) > 0:
+                for param in self._network.backbone.per_task_gates[-1].parameters():
+                    param.requires_grad = True
             self._network.to(self._device)
             optimizer = optim.SGD(
                 self._network.parameters(),
@@ -208,13 +247,23 @@ class Learner(BaseLearner):
                 res = model.forward_EMA(inputs)
                 outputs = res["logits"]
                 SL_x = res["SL_x"]
-                top5_values, top5_indices = torch.topk(outputs, k=Top, largest=True, sorted=True)
+                SL_floor = res.get("SL_floor", None)
+                topk = min(self.args.get("k", Top), outputs.shape[1])
+                if self.args.get("k_strategy", "fixed") == "dynamic":
+                    probs = torch.softmax(outputs / max(self.args.get("k_temperature", 1.0), 1e-6), dim=1)
+                    entropy = -(probs * probs.clamp_min(1e-8).log()).sum(dim=1)
+                    norm_entropy = entropy / max(np.log(max(outputs.shape[1], 2)), 1e-6)
+                    topk = int((self.args.get("k_min", 1) + torch.ceil(norm_entropy * (self.args.get("k_max", Top) - self.args.get("k_min", 1))).long()).clamp(self.args.get("k_min", 1), min(self.args.get("k_max", Top), outputs.shape[1])).max().item())
+                top5_values, top5_indices = torch.topk(outputs, k=min(topk, outputs.shape[1]), largest=True, sorted=True)
                 Task_ids_batch = top5_indices // self.args["init_cls"]
                 Task_ids_batch = Task_ids_batch.cpu().tolist()
                 unique_sorted_Task_ids = [self.deduplicate_and_sort(task_ids) for task_ids in Task_ids_batch]
                 all_logits = []
                 for idx in range(batch_size):
-                    logit = self._network.forwardnew(SL_x[idx:idx + 1], unique_sorted_Task_ids[idx])["logits"]
+                    x_floor = SL_floor[idx:idx + 1] if SL_floor is not None else None
+                    logit = self._network.forwardnew(
+                        SL_x[idx:idx + 1], unique_sorted_Task_ids[idx], x_floor=x_floor
+                    )["logits"]
                     all_logits.append(logit)
                 outputs = torch.cat(all_logits, dim=0)
             predicts = torch.max(outputs, dim=1)[1]

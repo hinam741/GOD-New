@@ -59,7 +59,7 @@ class ArcFace(nn.Module):
     def loss(self, logits, labels):
         return F.cross_entropy(logits, labels)
 class Multi_lora_etf(nn.Module):
-    def __init__(self, num_classes: int, in_channels: int, Hiddensize, increment) -> None:
+    def __init__(self, num_classes: int, in_channels: int, Hiddensize, increment, k_strategy="fixed", k=1, k_min=1, k_max=None, k_temperature=1.0) -> None:
         super(Multi_lora_etf, self).__init__()
         assert num_classes > 0, f'num_classes={num_classes} must be a positive integer'
         self.num_classes = num_classes
@@ -70,6 +70,11 @@ class Multi_lora_etf(nn.Module):
         for param in self.hidden_layer.parameters():
             param.requires_grad = False
         self.classes_per_task = increment
+        self.k_strategy = k_strategy
+        self.k = max(1, int(k))
+        self.k_min = max(1, int(k_min))
+        self.k_max = int(k_max or num_classes)
+        self.k_temperature = float(k_temperature)
         self.mapping_layer = nn.ModuleList()
         orth_vec = self.generate_random_orthogonal_matrix(self.in_channels, self.num_classes)
         i_nc_nc = torch.eye(self.num_classes)
@@ -102,10 +107,22 @@ class Multi_lora_etf(nn.Module):
         x = x / torch.norm(x, p=2, dim=1, keepdim=True)
         return x
 
-    def forward(self, x, layer_id):
+    def _dynamic_k(self, logits):
+        if self.k_strategy != "dynamic":
+            return min(self.k, logits.shape[1])
+        probs = torch.softmax(logits / max(self.k_temperature, 1e-6), dim=1)
+        entropy = -(probs * probs.clamp_min(1e-8).log()).sum(dim=1)
+        uncertainty = entropy / max(math.log(max(logits.shape[1], 2)), 1e-6)
+        upper = min(self.k_max, logits.shape[1])
+        adaptive = self.k_min + torch.ceil(uncertainty * (upper - self.k_min)).long()
+        return int(adaptive.clamp(self.k_min, upper).max().item())
+
+    def forward(self, x, layer_id, return_k=False):
         x = self.hidden_layer(x)
         processed_x = self.mapping_layer[layer_id](x)
         normalized_x = self.pre_logits(processed_x)
         etf_vec = F.normalize(self.etf_vec.T, p=2, dim=1)
         sliced_logits = F.linear(normalized_x, etf_vec) / 0.1
+        if return_k:
+            return sliced_logits, self._dynamic_k(sliced_logits)
         return sliced_logits

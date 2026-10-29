@@ -1,3 +1,4 @@
+import os
 import numpy as np
 from torchvision import datasets, transforms
 from utils.toolkit import split_images_labels
@@ -8,6 +9,35 @@ class iData(object):
     test_trsf = []
     common_trsf = []
     class_order = None
+
+
+def _resolve_split(root, split, default=None):
+    """Resolve an ImageFolder split from a configurable dataset root."""
+    if root is None:
+        root = default
+    if not root:
+        raise FileNotFoundError(
+            "Dataset path is not configured. Set dataset_root or the corresponding "
+            "train_dir/test_dir in the experiment config."
+        )
+    path = os.path.join(root, split)
+    return path if os.path.isdir(path) else root
+
+
+def _imagefolder_data(root, train_split="train", test_split="val"):
+    train_dset = datasets.ImageFolder(_resolve_split(root, train_split))
+    test_dset = datasets.ImageFolder(_resolve_split(root, test_split))
+    return (*split_images_labels(train_dset.imgs), *split_images_labels(test_dset.imgs))
+
+
+def _generic_imagefolder_transforms(args=None):
+    args = args or {}
+    image_size = int(args.get("image_size", 224))
+    train = [transforms.Grayscale(num_output_channels=3)] if args.get("grayscale", False) else []
+    train += [transforms.RandomResizedCrop(image_size), transforms.RandomHorizontalFlip(), transforms.ToTensor()]
+    test = [transforms.Grayscale(num_output_channels=3)] if args.get("grayscale", False) else []
+    test += [transforms.Resize(int(image_size * 256 / 224)), transforms.CenterCrop(image_size), transforms.ToTensor()]
+    return train, test
 
 
 class iCIFAR10(iData):
@@ -214,50 +244,55 @@ class iImageNetR(iData):
         super().__init__()
         self.args = args
         self.use_path = True
-
-        if args["model_name"] == "coda_prompt":
-            self.train_trsf = build_transform_coda_prompt(True, args)
-            self.test_trsf = build_transform_coda_prompt(False, args)
-        else:
-            self.train_trsf = build_transform(True, args)
-            self.test_trsf = build_transform(False, args)
-        self.common_trsf = [
-            # transforms.ToTensor(),
-        ]
-
-        self.class_order = np.arange(200).tolist()
+        self.train_trsf, self.test_trsf = _generic_imagefolder_transforms(args)
+        self.common_trsf = []
+        self.class_order = np.arange(int(args.get("num_classes", 200))).tolist()
 
     def download_data(self):
-        # assert 0, "You should specify the folder of your dataset"
-        train_dir = ""
-        test_dir = ""
-
-        train_dset = datasets.ImageFolder(train_dir)
-        test_dset = datasets.ImageFolder(test_dir)
-
-        self.train_data, self.train_targets = split_images_labels(train_dset.imgs)
-        self.test_data, self.test_targets = split_images_labels(test_dset.imgs)
+        root = self.args.get("dataset_root")
+        self.train_data, self.train_targets, self.test_data, self.test_targets = _imagefolder_data(root)
 
 
 class iImageNetA(iData):
-    use_path = True
-
-    train_trsf = build_transform(True, None)
-    test_trsf = build_transform(False, None)
-    common_trsf = []
-
-    class_order = np.arange(200).tolist()
+    def __init__(self, args=None):
+        super().__init__()
+        self.args = args or {}
+        self.use_path = True
+        self.train_trsf, self.test_trsf = _generic_imagefolder_transforms(self.args)
+        self.common_trsf = []
+        self.class_order = np.arange(int(self.args.get("num_classes", 200))).tolist()
 
     def download_data(self):
-        # assert 0, "You should specify the folder of your dataset"
-        train_dir = ""
-        test_dir = ""
+        root = self.args.get("dataset_root")
+        self.train_data, self.train_targets, self.test_data, self.test_targets = _imagefolder_data(root)
 
-        train_dset = datasets.ImageFolder(train_dir)
-        test_dset = datasets.ImageFolder(test_dir)
 
-        self.train_data, self.train_targets = split_images_labels(train_dset.imgs)
-        self.test_data, self.test_targets = split_images_labels(test_dset.imgs)
+class _ConfigurableImageFolder(iData):
+    def __init__(self, args=None):
+        super().__init__()
+        self.args = args or {}
+        self.use_path = True
+        self.train_trsf, self.test_trsf = _generic_imagefolder_transforms(self.args)
+        self.common_trsf = []
+
+    def download_data(self):
+        root = self.args.get("dataset_root")
+        self.train_data, self.train_targets, self.test_data, self.test_targets = _imagefolder_data(
+            root, self.args.get("train_split", "train"), self.args.get("test_split", "val")
+        )
+        self.class_order = np.arange(len(np.unique(self.train_targets))).tolist()
+
+
+class MSTAR(_ConfigurableImageFolder):
+    pass
+
+
+class NIHChestXray(_ConfigurableImageFolder):
+    pass
+
+
+class IndianPines(_ConfigurableImageFolder):
+    pass
 
 
 class CUB(iData):

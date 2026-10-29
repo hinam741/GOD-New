@@ -30,6 +30,26 @@
     "print_forget":true,
     "free": 9,
     "alpha": 0.9,
-    "m": 0.4
+    "m": 0.4,
+    "k_strategy": "fixed",
+    "k": 3,
+    "k_min": 1,
+    "k_max": 5,
+    "k_temperature": 1.0,
+    "split_strategy": "fixed",
+    "K_coarse": 9,
+    "K_floor": 6,
+    "split_k_min": 6,
+    "warmup_batches": 10,
+    "shift_tau": 1.15,
+    "shift_gamma": 6.0,
+    "efficiency_lambda": 0.0,
+    "use_gating": false,
+    "gate_beta_min": 0.05,
+    "dataset_root": "",
+    "train_split": "train",
+    "test_split": "val",
+    "image_size": 224,
+    "grayscale": false
 
 }

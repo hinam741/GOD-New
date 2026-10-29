@@ -11,6 +11,7 @@ from timm.models.vision_transformer import PatchEmbed
 from timm.models.registry import register_model
 import torch.nn.functional as F
 from collections import OrderedDict
+from utils.dynamic_split import LayerGate
 import torch
 
 class LoRALayer():
@@ -119,7 +120,14 @@ class LinearList(nn.Linear, LoRALayer):
             return w.transpose(0, 1) if self.fan_in_fan_out else w  
         nn.Linear.train(self, mode)
     
-    def forward(self, x: torch.Tensor, lora_ids: list = [0],ifEMA= False):
+    def forward(self, x: torch.Tensor, lora_ids: list = [0],ifEMA= False,
+                gate=None, shared_id: int = 0):
+        """gate: optional (alpha, beta) tuple for micro gating.
+
+        When provided and the requested task differs from shared_id,
+        output = alpha * Shared_LoRA(x) + beta * TaskSpecific_LoRA(x)
+        (plus frozen pretrained weight), per Paper/3 Eq.(3).
+        """
         def T(w):
             return w.transpose(0, 1) if self.fan_in_fan_out else w
         result = F.linear(x, T(self.weight), bias=self.bias)
@@ -133,6 +141,20 @@ class LinearList(nn.Linear, LoRALayer):
             result += lora_output
             return {'result': result, 'loraValue': lora_output}
         else:
+            # Micro-gating path: exactly one task id requested
+            if gate is not None and len(lora_ids) == 1 and lora_ids[0] != shared_id \
+                    and 0 <= shared_id < len(self.lora_As) and 0 <= lora_ids[0] < len(self.lora_As):
+                alpha, beta = gate
+                task_id = lora_ids[0]
+                sA, sB, tA, tB = self.lora_As[shared_id], self.lora_Bs[shared_id], \
+                    self.lora_As[task_id], self.lora_Bs[task_id]
+                s_scale, t_scale = self.task_scalings[shared_id], self.task_scalings[task_id]
+                d = self.lora_dropout(x)
+                shared_out = (d @ sA.transpose(0, 1) @ sB.transpose(0, 1)) * s_scale
+                task_out = (d @ tA.transpose(0, 1) @ tB.transpose(0, 1)) * t_scale
+                lora_output = alpha * shared_out + beta * task_out
+                result += lora_output
+                return {'result': result, 'loraValue': lora_output}
             for lora_id in lora_ids:
                 if 0 <= lora_id < len(self.lora_As):
                     lora_A = self.lora_As[lora_id]
@@ -228,12 +250,12 @@ class Attention(nn.Module):
         self.k_proj.copy_lora_weights(loraidA,loraidB,A_loras,B_loras)
         self.v_proj.copy_lora_weights(loraidA,loraidB,A_loras,B_loras)   
 
-    def forward(self, x,lora_ids=[0],ifEMA=False):
+    def forward(self, x,lora_ids=[0],ifEMA=False, gate=None):
         B, N, C = x.shape
 
-        q = self.q_proj(x,lora_ids,ifEMA)['result']
-        k = self._shape(self.k_proj(x,lora_ids,ifEMA)['result'], -1, B).view(B * self.num_heads, -1, self.head_dim)
-        v = self._shape(self.v_proj(x,lora_ids,ifEMA)['result'], -1, B).view(B * self.num_heads, -1, self.head_dim)
+        q = self.q_proj(x,lora_ids,ifEMA, gate=gate)['result']
+        k = self._shape(self.k_proj(x,lora_ids,ifEMA, gate=gate)['result'], -1, B).view(B * self.num_heads, -1, self.head_dim)
+        v = self._shape(self.v_proj(x,lora_ids,ifEMA, gate=gate)['result'], -1, B).view(B * self.num_heads, -1, self.head_dim)
         q = self._shape(q, N, B).view(B * self.num_heads, -1, self.head_dim)
 
         # attn = (q @ k.transpose(-2, -1)) * self.scale
@@ -283,8 +305,8 @@ class Block(nn.Module):
     def copy_lora_weights(self, loraidA: int, loraidB: int,A_loras: bool,B_loras:bool):
         self.attn.copy_lora_weights(loraidA,loraidB,A_loras,B_loras)
 
-    def forward(self, x,lora_ids=[0],ifEMA=False):
-        x = x + self.drop_path(self.attn(self.norm1(x),lora_ids,ifEMA))
+    def forward(self, x,lora_ids=[0],ifEMA=False, gate=None):
+        x = x + self.drop_path(self.attn(self.norm1(x),lora_ids,ifEMA, gate=gate))
         residual = x
         x = self.mlp_drop(self.act(self.fc1(self.norm2(x))))
         x = self.drop_path(self.mlp_drop(self.fc2(x)))
@@ -310,6 +332,22 @@ class VisionTransformer(nn.Module):
         norm_layer = norm_layer or partial(nn.LayerNorm, eps=1e-6)
         act_layer = act_layer or nn.GELU
         self.select=9
+        # Dynamic & Adaptive Layer Splitting (Paper/1 + Paper/3):
+        # per-block learnable gates mixing Shared LoRA (task 0) and
+        # current Task-specific LoRA. Disabled by default -> exact paper behavior.
+        self.use_gating = False
+        self.k_history = []
+        # --- Dynamic split config (defaults reproduce the static paper) ---
+        # K_coarse = global shared-trunk depth for the coarse/refined cache
+        #            (== the paper's fixed k = 9).
+        # K_floor  = universal shared depth; a domain-shifted task may lower its
+        #            split point k_t down to K_floor (never below).
+        self.dynamic_split = False
+        self.K_coarse = 9
+        self.K_floor = 6
+        self.gate_beta_min = 0.0
+        self.select_per_task = {}      # task_id -> split point k_t
+        self._SL_floor = None          # cache of feature at depth K_floor (EMA pass)
         self.patch_embed = embed_layer(
             img_size=img_size, patch_size=patch_size, in_chans=in_chans, embed_dim=embed_dim)
         num_patches = self.patch_embed.num_patches
@@ -328,6 +366,11 @@ class VisionTransformer(nn.Module):
             )
             for i in range(depth)])
         self.norm = norm_layer(embed_dim)
+        self.depth = depth
+        self.layer_gates = nn.ModuleList([LayerGate() for _ in range(depth)])
+        # Per-task gates (Level-2 micro gating). Each task owns its own gates so
+        # that training a new task never changes how old tasks are computed.
+        self.per_task_gates = nn.ModuleList()
 
         # Representation layer
         if representation_size and not distilled:
@@ -354,16 +397,63 @@ class VisionTransformer(nn.Module):
     def add_task(self):
         for block in self.blocks:
             self.cur_loraid =block.add_task()
+        # Grow a fresh set of per-task gates for this task (micro gating).
+        self.per_task_gates.append(
+            nn.ModuleList([LayerGate(beta_min=self.gate_beta_min) for _ in range(self.depth)])
+        )
+
+    def configure_split(self, dynamic=False, K_coarse=9, K_floor=6,
+                        use_gating=False, gate_beta_min=0.0):
+        """Set up dynamic layer-splitting. Call right after model creation.
+
+        With dynamic=False the model behaves exactly like the static paper.
+        """
+        self.dynamic_split = bool(dynamic)
+        self.K_coarse = int(K_coarse)
+        self.K_floor = int(K_floor)
+        self.use_gating = bool(use_gating)
+        self.gate_beta_min = float(gate_beta_min)
+        self.select = int(K_coarse)
+
+    def get_task_k(self, task_id):
+        """Split point k_t for a task (defaults to K_coarse = natural task)."""
+        return int(self.select_per_task.get(task_id, self.K_coarse))
+
     def freeze_lora(self,lora_ids: list, A_loras: bool,B_loras:bool):
         for block in self.blocks:
             block.freeze_lora(lora_ids,A_loras,B_loras)
 
     def unfreeze_lora(self,lora_ids,select=9):
-        lengh1 = select
-        self.select = lengh1
+        # `select` here is the per-task split point k_t: blocks [k_t, depth)
+        # are opened (task-specific), blocks [0, k_t) stay shared/frozen.
+        lengh1 = int(select)
+        if not hasattr(self, 'k_history'):
+            self.k_history = []
+        self.k_history.append(lengh1)
+        # Record k_t for this task (used by the two-tier refined inference).
+        for lid in lora_ids:
+            self.select_per_task[int(lid)] = lengh1
+        # In static mode the global trunk depth == k_t. In dynamic mode the
+        # coarse-trunk cache depth MUST stay at K_coarse (global) so the
+        # single-trunk fast path and TL_ema remain well-defined; per-task depth
+        # is tracked separately in select_per_task.
+        if not self.dynamic_split:
+            self.select = lengh1
+        else:
+            self.select = int(self.K_coarse)
         for block in self.blocks[lengh1:]:
             block.unfreeze_lora(lora_ids)
         print(lengh1)
+    def set_task_gating(self, enabled=True):
+        """Enable/disable micro gating (Shared vs Task-specific mixing)."""
+        self.use_gating = enabled
+    def get_gate_weights(self):
+        """Return list of (alpha, beta) per block for logging/analysis."""
+        out = []
+        for g in self.layer_gates:
+            a, b = g.weights()
+            out.append((a.item(), b.item()))
+        return out
     def startEMA(self):
         for block in self.blocks:
             block.startEMA()
@@ -398,10 +488,21 @@ class VisionTransformer(nn.Module):
         x = x + self.pos_embed
         x = self.pos_drop(x)
         SL_x = None
+        self._SL_floor = None
+        # Depth at which the (global) coarse shared feature is cached.
+        cache_coarse = (self.K_coarse if self.dynamic_split else self.select)
+        # Per-task gate selection (micro gating) only on the single-id train path.
+        gate_task = lora_ids[0] if (len(lora_ids) == 1) else None
         for idx, blk in enumerate(self.blocks):
-            x = blk(x,lora_ids,ifEMA)
-            if (ifEMA and idx == self.select-1):
+            g = None
+            if self.use_gating and not ifEMA and gate_task is not None \
+                    and 0 <= gate_task < len(self.per_task_gates):
+                g = self.per_task_gates[gate_task][idx].weights()
+            x = blk(x,lora_ids,ifEMA, gate=g)
+            if ifEMA and idx == cache_coarse - 1:
                 SL_x = x
+            if ifEMA and self.dynamic_split and idx == self.K_floor - 1:
+                self._SL_floor = x
         if self.global_pool:
             x = x[:, 1:, :].mean(dim=1)  # global pool without cls token
             outcome = self.fc_norm(x)
@@ -426,22 +527,48 @@ class VisionTransformer(nn.Module):
     def forward_SL(self,x,lora_ids):
         for idx, blk in enumerate(self.blocks[self.select:]):
             x = blk(x,lora_ids)
+        return self._finalize(x)
+
+    def _finalize(self, x):
+        """Shared tail (norm + optional global pool + head) used by refined mode."""
         if self.global_pool:
             x = x[:, 1:, :].mean(dim=1)  # global pool without cls token
             outcome = self.fc_norm(x)
         else:
             x = self.norm(x)
-            x = x[:, 0]
+            outcome = x[:, 0]
         if self.head_dist is not None:
-            x, x_dist = self.head(x[0]), self.head_dist(x[1])  # x must be a tuple
+            x, x_dist = self.head(outcome[0]), self.head_dist(outcome[1])
             if self.training and not torch.jit.is_scripting():
-                # during inference, return the average of both classifier predictions
                 return x, x_dist
             else:
                 return (x + x_dist) / 2
-        else:
-            x = self.head(x)
-        return x
+        return self.head(outcome)
+
+    def _task_gate(self, task_id, idx):
+        if self.use_gating and 0 <= task_id < len(self.per_task_gates):
+            return self.per_task_gates[task_id][idx].weights()
+        return None
+
+    def forward_SL_dynamic(self, x_coarse, x_floor, task_id, k_t):
+        """Two-tier refined-mode feature for `task_id` given its split point k_t.
+
+        Natural task (k_t >= K_coarse) OR static mode: run deep blocks on the
+            coarse cache -> identical fast path to the static method.
+        Shifted task (k_t < K_coarse): re-encode from the floor cache, running
+            shared blocks [K_floor:k_t] (LoRA id 0) then task blocks [k_t:].
+        """
+        if (not self.dynamic_split) or k_t >= self.K_coarse or x_floor is None:
+            x = x_coarse
+            for idx in range(self.K_coarse, len(self.blocks)):
+                x = self.blocks[idx](x, [task_id], gate=self._task_gate(task_id, idx))
+            return self._finalize(x)
+        x = x_floor
+        for idx in range(self.K_floor, k_t):
+            x = self.blocks[idx](x, [0])                      # shared LoRA segment
+        for idx in range(k_t, len(self.blocks)):
+            x = self.blocks[idx](x, [task_id], gate=self._task_gate(task_id, idx))
+        return self._finalize(x)
 
 
 
