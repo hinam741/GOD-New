@@ -12,3 +12,5 @@ new_datasets.txt
 *.ipynb
 *Paper/
 *.md/
+*datasets/
+*hinam_log/
