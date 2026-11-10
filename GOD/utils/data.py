@@ -21,7 +21,18 @@ def _resolve_split(root, split, default=None):
             "train_dir/test_dir in the experiment config."
         )
     path = os.path.join(root, split)
-    return path if os.path.isdir(path) else root
+    if os.path.isdir(path):
+        return path
+    # Fall back to root only when root is itself a plain class-folder dataset.
+    # If root holds split folders (train/test/val), a missing split is a config error:
+    # silently using root would turn the split names into class labels.
+    siblings = [d for d in ("train", "test", "val") if os.path.isdir(os.path.join(root, d))]
+    if siblings:
+        raise FileNotFoundError(
+            f"Split '{split}' not found in {root} (found: {siblings}). "
+            "Set train_split/test_split in the experiment config."
+        )
+    return root
 
 
 def _imagefolder_data(root, train_split="train", test_split="val"):
@@ -252,7 +263,9 @@ class iImageNetR(iData):
 
     def download_data(self):
         root = self.args.get("dataset_root")
-        self.train_data, self.train_targets, self.test_data, self.test_targets = _imagefolder_data(root)
+        self.train_data, self.train_targets, self.test_data, self.test_targets = _imagefolder_data(
+            root, self.args.get("train_split", "train"), self.args.get("test_split", "val")
+        )
 
 
 class iImageNetA(iData):
@@ -268,7 +281,9 @@ class iImageNetA(iData):
 
     def download_data(self):
         root = self.args.get("dataset_root")
-        self.train_data, self.train_targets, self.test_data, self.test_targets = _imagefolder_data(root)
+        self.train_data, self.train_targets, self.test_data, self.test_targets = _imagefolder_data(
+            root, self.args.get("train_split", "train"), self.args.get("test_split", "val")
+        )
 
 
 class _ConfigurableImageFolder(iData):
