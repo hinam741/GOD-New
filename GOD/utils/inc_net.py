@@ -114,7 +114,7 @@ class IncrementalNet_ETF_mutli_lora(BaseNet):
             k_temperature=self.args.get("k_temperature", 1.0),
         )
     def generate_simplefc(self, in_dim, out_dim):
-        fc = ArcFace(in_dim, out_dim,m=self.args["m"])
+        fc = ArcFace(in_dim, out_dim, s=self.args.get("s", 30.0), m=self.args["m"])
         return fc
     def update_simplefc(self, nb_classes):
         fc = self.generate_simplefc(self.feature_dim, nb_classes)
