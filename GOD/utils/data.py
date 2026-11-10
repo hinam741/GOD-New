@@ -181,8 +181,10 @@ class iCIFAR224(iData):
         self.class_order = np.arange(100).tolist()
 
     def download_data(self):
-        train_dataset = datasets.cifar.CIFAR100("", train=True, download=True)
-        test_dataset = datasets.cifar.CIFAR100("", train=False, download=True)
+        # root = thu muc chua cifar-100-python/ (config "dataset_root"); "" = thu muc dang chay
+        root = (self.args or {}).get("dataset_root") or ""
+        train_dataset = datasets.cifar.CIFAR100(root, train=True, download=True)
+        test_dataset = datasets.cifar.CIFAR100(root, train=False, download=True)
         self.train_data, self.train_targets = train_dataset.data, np.array(
             train_dataset.targets
         )
