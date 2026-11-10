@@ -256,9 +256,7 @@ class iImageNetR(iData):
         self.args = args
         self.use_path = True
         self.train_trsf, self.test_trsf = _generic_imagefolder_transforms(args)
-        self.common_trsf = [
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-        ]
+        self.common_trsf = []
         self.class_order = np.arange(int(args.get("num_classes", 200))).tolist()
 
     def download_data(self):
@@ -274,9 +272,7 @@ class iImageNetA(iData):
         self.args = args or {}
         self.use_path = True
         self.train_trsf, self.test_trsf = _generic_imagefolder_transforms(self.args)
-        self.common_trsf = [
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-        ]
+        self.common_trsf = []
         self.class_order = np.arange(int(self.args.get("num_classes", 200))).tolist()
 
     def download_data(self):
