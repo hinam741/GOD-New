@@ -227,11 +227,20 @@ class Learner(BaseLearner):
             inputs = inputs.to(self._device)
             with torch.no_grad():
                 outputs = self._network(inputs,self._cur_task)["logits"]
+            # Fewer logits than topk (e.g. first task with 2 or 4 classes): take what
+            # exists and pad with -1 so the [bs, topk] shape used downstream is kept.
+            k_eval = min(self.topk, outputs.shape[1])
             predicts = torch.topk(
-                outputs, k=self.topk, dim=1, largest=True, sorted=True
+                outputs, k=k_eval, dim=1, largest=True, sorted=True
             )[
                 1
-            ]  # [bs, topk]
+            ]  # [bs, k_eval]
+            if k_eval < self.topk:
+                pad = torch.full(
+                    (predicts.shape[0], self.topk - k_eval), -1,
+                    dtype=predicts.dtype, device=predicts.device,
+                )
+                predicts = torch.cat([predicts, pad], dim=1)  # [bs, topk]
             y_pred.append(predicts.cpu().numpy())
             y_true.append(targets.cpu().numpy())
 
