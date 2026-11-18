@@ -346,6 +346,11 @@ class VisionTransformer(nn.Module):
         self.K_coarse = 9
         self.K_floor = 6
         self.gate_beta_min = 0.0
+        # E14: gates are applied only on blocks idx >= gate_min_block (0 = every block,
+        # the earlier behaviour). Setting it to K_coarse keeps the shared trunk
+        # (blocks 0..K_coarse-1, the part the EMA / coarse cache runs) free of gates,
+        # so the EMA trunk matches the function that was trained.
+        self.gate_min_block = 0
         self.select_per_task = {}      # task_id -> split point k_t
         self._SL_floor = None          # cache of feature at depth K_floor (EMA pass)
         self.patch_embed = embed_layer(
@@ -403,7 +408,7 @@ class VisionTransformer(nn.Module):
         )
 
     def configure_split(self, dynamic=False, K_coarse=9, K_floor=6,
-                        use_gating=False, gate_beta_min=0.0):
+                        use_gating=False, gate_beta_min=0.0, gate_min_block=0):
         """Set up dynamic layer-splitting. Call right after model creation.
 
         With dynamic=False the model behaves exactly like the static paper.
@@ -413,6 +418,7 @@ class VisionTransformer(nn.Module):
         self.K_floor = int(K_floor)
         self.use_gating = bool(use_gating)
         self.gate_beta_min = float(gate_beta_min)
+        self.gate_min_block = max(0, int(gate_min_block))
         self.select = int(K_coarse)
 
     def get_task_k(self, task_id):
@@ -496,6 +502,7 @@ class VisionTransformer(nn.Module):
         for idx, blk in enumerate(self.blocks):
             g = None
             if self.use_gating and not ifEMA and gate_task is not None \
+                    and idx >= self.gate_min_block \
                     and 0 <= gate_task < len(self.per_task_gates):
                 g = self.per_task_gates[gate_task][idx].weights()
             x = blk(x,lora_ids,ifEMA, gate=g)
@@ -525,8 +532,12 @@ class VisionTransformer(nn.Module):
             x = self.head(x)
         return x,SL_x
     def forward_SL(self,x,lora_ids):
-        for idx, blk in enumerate(self.blocks[self.select:]):
-            x = blk(x,lora_ids)
+        # Static refined path: apply the same per-task gates as in training (single task id),
+        # on the same blocks (idx >= gate_min_block). Without gating _task_gate returns None.
+        single = lora_ids[0] if len(lora_ids) == 1 else None
+        for j, blk in enumerate(self.blocks[self.select:]):
+            g = self._task_gate(single, self.select + j) if single is not None else None
+            x = blk(x, lora_ids, gate=g)
         return self._finalize(x)
 
     def _finalize(self, x):
@@ -546,7 +557,7 @@ class VisionTransformer(nn.Module):
         return self.head(outcome)
 
     def _task_gate(self, task_id, idx):
-        if self.use_gating and 0 <= task_id < len(self.per_task_gates):
+        if self.use_gating and idx >= self.gate_min_block and 0 <= task_id < len(self.per_task_gates):
             return self.per_task_gates[task_id][idx].weights()
         return None
 

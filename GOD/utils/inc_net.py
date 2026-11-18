@@ -99,6 +99,7 @@ class IncrementalNet_ETF_mutli_lora(BaseNet):
             K_floor=int(args.get("K_floor", 6)),
             use_gating=bool(args.get("use_gating", False)),
             gate_beta_min=float(args.get("gate_beta_min", 0.0)),
+            gate_min_block=int(args.get("gate_min_block", 0)),
         )
 
     def update_fc(self, nb_classes, Hiddensize, increment):
