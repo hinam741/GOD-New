@@ -351,6 +351,10 @@ class VisionTransformer(nn.Module):
         # (blocks 0..K_coarse-1, the part the EMA / coarse cache runs) free of gates,
         # so the EMA trunk matches the function that was trained.
         self.gate_min_block = 0
+        # E15: gate_scope = "global" (default) -> gate on blocks idx >= gate_min_block for every task
+        # (E14 behaviour); "task_k" -> gate on blocks idx >= max(gate_min_block, k_t of that task),
+        # i.e. only on the blocks whose task LoRA is actually trained.
+        self.gate_scope = "global"
         self.select_per_task = {}      # task_id -> split point k_t
         self._SL_floor = None          # cache of feature at depth K_floor (EMA pass)
         self.patch_embed = embed_layer(
@@ -408,7 +412,8 @@ class VisionTransformer(nn.Module):
         )
 
     def configure_split(self, dynamic=False, K_coarse=9, K_floor=6,
-                        use_gating=False, gate_beta_min=0.0, gate_min_block=0):
+                        use_gating=False, gate_beta_min=0.0, gate_min_block=0,
+                        gate_scope="global"):
         """Set up dynamic layer-splitting. Call right after model creation.
 
         With dynamic=False the model behaves exactly like the static paper.
@@ -419,11 +424,20 @@ class VisionTransformer(nn.Module):
         self.use_gating = bool(use_gating)
         self.gate_beta_min = float(gate_beta_min)
         self.gate_min_block = max(0, int(gate_min_block))
+        if gate_scope not in ("global", "task_k"):
+            raise ValueError("gate_scope must be 'global' or 'task_k', got {!r}".format(gate_scope))
+        self.gate_scope = gate_scope
         self.select = int(K_coarse)
 
     def get_task_k(self, task_id):
         """Split point k_t for a task (defaults to K_coarse = natural task)."""
         return int(self.select_per_task.get(task_id, self.K_coarse))
+
+    def gate_start(self, task_id):
+        """First block index on which task_id's gate is applied (E14 / E15)."""
+        if self.gate_scope == "task_k":
+            return max(self.gate_min_block, self.get_task_k(task_id))
+        return self.gate_min_block
 
     def freeze_lora(self,lora_ids: list, A_loras: bool,B_loras:bool):
         for block in self.blocks:
@@ -462,7 +476,7 @@ class VisionTransformer(nn.Module):
         return out
     def get_task_gate_weights(self, task_id):
         """E16: (alpha, beta) of every block for one task's micro gates, plus whether the
-        gate is actually applied on that block (use_gating and idx >= gate_min_block).
+        gate is actually applied on that block (use_gating and idx >= gate_start(task_id)).
         alpha = weight of Shared LoRA (task 0), beta = weight of the task LoRA."""
         out = []
         if not (0 <= task_id < len(self.per_task_gates)):
@@ -470,7 +484,7 @@ class VisionTransformer(nn.Module):
         with torch.no_grad():
             for idx, g in enumerate(self.per_task_gates[task_id]):
                 a, b = g.weights()
-                out.append((float(a), float(b), bool(self.use_gating and idx >= self.gate_min_block)))
+                out.append((float(a), float(b), bool(self.use_gating and idx >= self.gate_start(task_id))))
         return out
     def startEMA(self):
         for block in self.blocks:
@@ -511,10 +525,11 @@ class VisionTransformer(nn.Module):
         cache_coarse = (self.K_coarse if self.dynamic_split else self.select)
         # Per-task gate selection (micro gating) only on the single-id train path.
         gate_task = lora_ids[0] if (len(lora_ids) == 1) else None
+        g_start = self.gate_start(gate_task) if gate_task is not None else 0
         for idx, blk in enumerate(self.blocks):
             g = None
             if self.use_gating and not ifEMA and gate_task is not None \
-                    and idx >= self.gate_min_block \
+                    and idx >= g_start \
                     and 0 <= gate_task < len(self.per_task_gates):
                 g = self.per_task_gates[gate_task][idx].weights()
             x = blk(x,lora_ids,ifEMA, gate=g)
@@ -569,7 +584,7 @@ class VisionTransformer(nn.Module):
         return self.head(outcome)
 
     def _task_gate(self, task_id, idx):
-        if self.use_gating and idx >= self.gate_min_block and 0 <= task_id < len(self.per_task_gates):
+        if self.use_gating and 0 <= task_id < len(self.per_task_gates) and idx >= self.gate_start(task_id):
             return self.per_task_gates[task_id][idx].weights()
         return None
 

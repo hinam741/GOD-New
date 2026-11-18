@@ -165,9 +165,10 @@ class Learner(BaseLearner):
             fz = [alphas[i] for i in applied if i < k_t]
             mean = lambda v: "{:.3f}".format(sum(v) / len(v)) if v else "-"
             logging.info(
-                "[GATE] task {} | k_t={} | gate_min_block={} | beta_min={} | applied={} | "
+                "[GATE] task {} | k_t={} | gate_min_block={} | gate_scope={} | beta_min={} | applied={} | "
                 "alpha={} | mean_alpha trained(>=k_t)={} frozen(<k_t)={}".format(
-                    self._cur_task, k_t, getattr(bb, "gate_min_block", 0), self.args.get("gate_beta_min", 0.0),
+                    self._cur_task, k_t, getattr(bb, "gate_min_block", 0), getattr(bb, "gate_scope", "global"),
+                    self.args.get("gate_beta_min", 0.0),
                     "{}-{}".format(applied[0], applied[-1]) if applied else "none",
                     [round(a, 3) for a in alphas], mean(tr), mean(fz)))
         except Exception as e:
