@@ -460,6 +460,18 @@ class VisionTransformer(nn.Module):
             a, b = g.weights()
             out.append((a.item(), b.item()))
         return out
+    def get_task_gate_weights(self, task_id):
+        """E16: (alpha, beta) of every block for one task's micro gates, plus whether the
+        gate is actually applied on that block (use_gating and idx >= gate_min_block).
+        alpha = weight of Shared LoRA (task 0), beta = weight of the task LoRA."""
+        out = []
+        if not (0 <= task_id < len(self.per_task_gates)):
+            return out
+        with torch.no_grad():
+            for idx, g in enumerate(self.per_task_gates[task_id]):
+                a, b = g.weights()
+                out.append((float(a), float(b), bool(self.use_gating and idx >= self.gate_min_block)))
+        return out
     def startEMA(self):
         for block in self.blocks:
             block.startEMA()

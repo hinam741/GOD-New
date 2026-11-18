@@ -142,8 +142,36 @@ class Learner(BaseLearner):
             scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=self.args['init_epoch'],
                                                              eta_min=self.args['min_lr'])
             self._update_representation(train_loader, test_loader, optimizer, scheduler)
+            if self.args.get("use_gating", False):
+                self._log_gates(k_t)
             result3 = self._compute_accuracy_EMA_Task(self._network, test_loader,Top=3)
             self.all_ema3.append(result3['top1_accuracy'])
+
+    def _log_gates(self, k_t):
+        """E16: log the learned micro gates of the task just trained (old tasks' gates are frozen).
+        One line per task:  [GATE] task t | k_t | gate_min_block | beta_min | applied blocks |
+        alpha per block (Shared LoRA weight; beta = 1 - alpha) | mean alpha on the trained blocks
+        (idx >= k_t) and on the frozen blocks that still use a gate (gate_min_block <= idx < k_t).
+        Logging only: any error is caught so it can never stop a run."""
+        try:
+            bb = self._network.module.backbone if hasattr(self._network, "module") else self._network.backbone
+            w = bb.get_task_gate_weights(self._cur_task)
+            if not w:
+                return
+            k_t = int(k_t)
+            alphas = [a for a, _, _ in w]
+            applied = [i for i, (_, _, on) in enumerate(w) if on]
+            tr = [alphas[i] for i in applied if i >= k_t]
+            fz = [alphas[i] for i in applied if i < k_t]
+            mean = lambda v: "{:.3f}".format(sum(v) / len(v)) if v else "-"
+            logging.info(
+                "[GATE] task {} | k_t={} | gate_min_block={} | beta_min={} | applied={} | "
+                "alpha={} | mean_alpha trained(>=k_t)={} frozen(<k_t)={}".format(
+                    self._cur_task, k_t, getattr(bb, "gate_min_block", 0), self.args.get("gate_beta_min", 0.0),
+                    "{}-{}".format(applied[0], applied[-1]) if applied else "none",
+                    [round(a, 3) for a in alphas], mean(tr), mean(fz)))
+        except Exception as e:
+            logging.info("[GATE] task {} | log failed: {}".format(self._cur_task, e))
 
     def _init_train(self, train_loader, test_loader, optimizer, scheduler):
         prog_bar = tqdm(range(self.args["init_epoch"]))
