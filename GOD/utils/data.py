@@ -312,6 +312,11 @@ class IndianPines(_ConfigurableImageFolder):
     pass
 
 
+class DomainNet(_ConfigurableImageFolder):
+    # DomainNet (mot mien, vd Clipart) da dung thanh ImageFolder train/<lop>/ + test/<lop>/ (notebook CELL 2c)
+    pass
+
+
 class CUB(iData):
     use_path = True
 
