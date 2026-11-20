@@ -196,6 +196,17 @@ class LinearList(nn.Linear, LoRALayer):
             raise ValueError(f"Invalid lora_id. loraidA should be between 0 and {len(self.lora_As)-1}, "
                             f"and loraidB should be between 0 and {len(self.lora_As)-1}.")
 
+    def copy_from(self, src_id: int, dst_id: int):
+        """F1: overwrite the values of LoRA `dst_id` with those of LoRA `src_id`, in place.
+        Unlike copy_lora_weights (which rebinds the ParameterList entry to a clone) this keeps the
+        same Parameter object, so any optimizer / hook holding it stays valid."""
+        n = len(self.lora_As)
+        if not (0 <= src_id < n and 0 <= dst_id < n):
+            raise ValueError(f"Invalid lora ids: src {src_id}, dst {dst_id}, have {n} LoRA modules.")
+        with torch.no_grad():
+            self.lora_As[dst_id].data.copy_(self.lora_As[src_id].data)
+            self.lora_Bs[dst_id].data.copy_(self.lora_Bs[src_id].data)
+
     
 class Attention(nn.Module):
     def __init__(self, dim, num_heads=8, qkv_bias=False, attn_drop=0., proj_drop=0., config=None):
@@ -249,6 +260,10 @@ class Attention(nn.Module):
         self.q_proj.copy_lora_weights(loraidA,loraidB,A_loras,B_loras)
         self.k_proj.copy_lora_weights(loraidA,loraidB,A_loras,B_loras)
         self.v_proj.copy_lora_weights(loraidA,loraidB,A_loras,B_loras)   
+    def copy_from(self, src_id: int, dst_id: int):
+        self.q_proj.copy_from(src_id, dst_id)
+        self.k_proj.copy_from(src_id, dst_id)
+        self.v_proj.copy_from(src_id, dst_id)
 
     def forward(self, x,lora_ids=[0],ifEMA=False, gate=None):
         B, N, C = x.shape
@@ -304,6 +319,8 @@ class Block(nn.Module):
         self.attn.EMA(alpha)
     def copy_lora_weights(self, loraidA: int, loraidB: int,A_loras: bool,B_loras:bool):
         self.attn.copy_lora_weights(loraidA,loraidB,A_loras,B_loras)
+    def copy_from(self, src_id: int, dst_id: int):
+        self.attn.copy_from(src_id, dst_id)
 
     def forward(self, x,lora_ids=[0],ifEMA=False, gate=None):
         x = x + self.drop_path(self.attn(self.norm1(x),lora_ids,ifEMA, gate=gate))
@@ -355,6 +372,12 @@ class VisionTransformer(nn.Module):
         # (E14 behaviour); "task_k" -> gate on blocks idx >= max(gate_min_block, k_t of that task),
         # i.e. only on the blocks whose task LoRA is actually trained.
         self.gate_scope = "global"
+        # F1 / F2 (dynamic split only, both off by default = earlier behaviour):
+        #   lora_init_shared   : a new task's LoRA on blocks < K_coarse starts from LoRA 0 (task 0), not from the previous task
+        #   ema_shallow_frozen : EMA() leaves blocks < K_coarse untouched (they stay equal to LoRA 0 after startEMA)
+        # With both on, the shared trunk (blocks 0..K_coarse-1) seen by the coarse / refined caches is exactly LoRA 0.
+        self.lora_init_shared = False
+        self.ema_shallow_frozen = False
         self.select_per_task = {}      # task_id -> split point k_t
         self._SL_floor = None          # cache of feature at depth K_floor (EMA pass)
         self.patch_embed = embed_layer(
@@ -406,6 +429,13 @@ class VisionTransformer(nn.Module):
     def add_task(self):
         for block in self.blocks:
             self.cur_loraid =block.add_task()
+        # F1: shared trunk = LoRA 0. LinearList.add_task copied the previous task's LoRA; overwrite the
+        # blocks of the shared trunk (< K_coarse) with LoRA 0 so every task starts from the same trunk.
+        # (new id from the LoRA count: Block.add_task / Attention.add_task do not return the id)
+        new_id = len(self.blocks[0].attn.q_proj.lora_As) - 1
+        if self.lora_init_shared and new_id > 0:
+            for idx in range(min(self.K_coarse, len(self.blocks))):
+                self.blocks[idx].copy_from(0, new_id)
         # Grow a fresh set of per-task gates for this task (micro gating).
         self.per_task_gates.append(
             nn.ModuleList([LayerGate(beta_min=self.gate_beta_min) for _ in range(self.depth)])
@@ -413,7 +443,7 @@ class VisionTransformer(nn.Module):
 
     def configure_split(self, dynamic=False, K_coarse=9, K_floor=6,
                         use_gating=False, gate_beta_min=0.0, gate_min_block=0,
-                        gate_scope="global"):
+                        gate_scope="global", lora_init_shared=False, ema_shallow_frozen=False):
         """Set up dynamic layer-splitting. Call right after model creation.
 
         With dynamic=False the model behaves exactly like the static paper.
@@ -427,6 +457,9 @@ class VisionTransformer(nn.Module):
         if gate_scope not in ("global", "task_k"):
             raise ValueError("gate_scope must be 'global' or 'task_k', got {!r}".format(gate_scope))
         self.gate_scope = gate_scope
+        # F1 / F2 only make sense with a dynamic split; with a static split they are ignored.
+        self.lora_init_shared = bool(dynamic and lora_init_shared)
+        self.ema_shallow_frozen = bool(dynamic and ema_shallow_frozen)
         self.select = int(K_coarse)
 
     def get_task_k(self, task_id):
@@ -490,8 +523,30 @@ class VisionTransformer(nn.Module):
         for block in self.blocks:
             block.startEMA()
     def EMA(self,alpha):
-        for block in self.blocks:
+        for idx, block in enumerate(self.blocks):
+            # F2: keep the shared trunk of the EMA adapter equal to LoRA 0 (set by startEMA after task 0)
+            if self.ema_shallow_frozen and idx < self.K_coarse:
+                continue
             block.EMA(alpha)
+    def shared_trunk_deviation(self, task_id, k_t):
+        """F1 / F2 check (logging only). Returns
+        (max |LoRA_task - LoRA_0| over blocks < k_t, max |EMA - LoRA_0| over blocks < K_coarse),
+        over q / k / v A and B matrices. Both are 0 when F1 + F2 hold; None if task_id has no LoRA."""
+        dev_task, dev_ema = 0.0, 0.0
+        with torch.no_grad():
+            for idx, blk in enumerate(self.blocks):
+                for proj in (blk.attn.q_proj, blk.attn.k_proj, blk.attn.v_proj):
+                    if task_id >= len(proj.lora_As):
+                        return None
+                    if idx < int(k_t):
+                        dev_task = max(dev_task,
+                                       float((proj.lora_As[task_id] - proj.lora_As[0]).abs().max()),
+                                       float((proj.lora_Bs[task_id] - proj.lora_Bs[0]).abs().max()))
+                    if idx < self.K_coarse:
+                        dev_ema = max(dev_ema,
+                                      float((proj.lora_emaA - proj.lora_As[0]).abs().max()),
+                                      float((proj.lora_emaB - proj.lora_Bs[0]).abs().max()))
+        return dev_task, dev_ema
     def copy_lora_weights(self, loraidA: int, loraidB: int,A_loras: bool,B_loras:bool):
         for block in self.blocks:
             block.copy_lora_weights(loraidA,loraidB,A_loras,B_loras)

@@ -144,8 +144,27 @@ class Learner(BaseLearner):
             self._update_representation(train_loader, test_loader, optimizer, scheduler)
             if self.args.get("use_gating", False):
                 self._log_gates(k_t)
+            if self.args.get("lora_init_shared", False) or self.args.get("ema_shallow_frozen", False):
+                self._log_f12(k_t)
             result3 = self._compute_accuracy_EMA_Task(self._network, test_loader,Top=3)
             self.all_ema3.append(result3['top1_accuracy'])
+
+    def _log_f12(self, k_t):
+        """F1 / F2 check: after training task t, the LoRA of t on blocks < k_t and the EMA adapter on the
+        shared trunk (blocks < K_coarse) must still equal LoRA 0. Logging only; errors are caught.
+        Expected values: F1 on -> dev_task = 0; F2 on -> dev_ema = 0 (up to float error)."""
+        try:
+            bb = self._network.module.backbone if hasattr(self._network, "module") else self._network.backbone
+            dev = bb.shared_trunk_deviation(self._cur_task, k_t)
+            if dev is None:
+                return
+            logging.info(
+                "[F12] task {} | k_t={} | lora_init_shared={} ema_shallow_frozen={} | "
+                "max|LoRA_t-LoRA_0| block<k_t={:.3e} | max|EMA-LoRA_0| block<{}={:.3e}".format(
+                    self._cur_task, int(k_t), bool(getattr(bb, "lora_init_shared", False)),
+                    bool(getattr(bb, "ema_shallow_frozen", False)), dev[0], bb.K_coarse, dev[1]))
+        except Exception as e:
+            logging.info("[F12] task {} | log failed: {}".format(self._cur_task, e))
 
     def _log_gates(self, k_t):
         """E16: log the learned micro gates of the task just trained (old tasks' gates are frozen).

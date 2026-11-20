@@ -101,6 +101,8 @@ class IncrementalNet_ETF_mutli_lora(BaseNet):
             gate_beta_min=float(args.get("gate_beta_min", 0.0)),
             gate_min_block=int(args.get("gate_min_block", 0)),
             gate_scope=str(args.get("gate_scope", "global")),
+            lora_init_shared=bool(args.get("lora_init_shared", False)),
+            ema_shallow_frozen=bool(args.get("ema_shallow_frozen", False)),
         )
 
     def update_fc(self, nb_classes, Hiddensize, increment):
